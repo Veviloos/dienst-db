@@ -9,13 +9,13 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import {DateTime} from '/opt/dienstdb/node_modules/luxon/src/luxon.js';
 
-const VERSION = '2.0.2';
+const VERSION = '2.1.0';
 const API = 'https://api.transitous.org/api';
 const UA = `dienst-db/${VERSION} (+https://github.com/Veviloos/dienst-db)`;
 const STATE = process.env.DIENSTDB_STATE || '/var/lib/dienstdb';  // tests only
 const LOG = process.env.DIENSTDB_LOG || '/var/log/dienst-db.log';  // tests only
 const TZ = 'Europe/Berlin';
-const MAX_OUT = 20_000, MAX_JOURNEYS = 6, SHOW = 3, TIMEOUT_MS = 20_000, MAX_BODY = 5_000_000;
+const MAX_OUT = 20_000, SHOW = 6, QUERY_N = 10, TIMEOUT_MS = 20_000, MAX_BODY = 5_000_000;
 const PER_MINUTE = 4, PER_DAY = 100, CACHE_S = 120, STATION_CACHE_S = 86_400;
 const STATION = /^(?=.*\p{L})[\p{L}\p{N} ().\/'-]{2,60}$/u;  // a name; or an EVA number (7 digits)
 const UNAVAILABLE = 'nicht verfügbar';
@@ -127,12 +127,20 @@ export const shapeJourney = (j) => {
 	};
 };
 
-// only what fits the asked time (live time if there is one): arrive by T → the 3 latest arrivals ≤ T; depart from T →
-// the first 3 departures ≥ T; both shown in time order. Times are 'yyyy-MM-dd HH:mm' in Berlin, so text order = time order.
-export const choose = (vs, art, t) => (art === 'an'
-	? vs.filter(v => v.an && v.an <= t).sort((x, y) => (x.an < y.an ? -1 : x.an > y.an ? 1 : 0)).slice(-SHOW)
-	: vs.filter(v => v.ab && v.ab >= t).sort((x, y) => (x.ab < y.ab ? -1 : x.ab > y.ab ? 1 : 0)).slice(0, SHOW))
-	.sort((x, y) => (x.ab < y.ab ? -1 : x.ab > y.ab ? 1 : 0));
+// only what fits the asked time T ± 30′ (arrival for --an, departure for --ab; live time if there is one), up to SHOW,
+// in time order. None inside: the nearest before and the nearest after, marked ausserhalb. Times are 'yyyy-MM-dd HH:mm'
+// in Berlin, so text order = time order.
+const fmt = (dt) => dt.toFormat('yyyy-MM-dd HH:mm');
+export const choose = (vs, art, when) => {
+	const k = art === 'an' ? 'an' : 'ab', lo = fmt(when.minus({minutes: 30})), hi = fmt(when.plus({minutes: 30}));
+	const seen = new Set();
+	const s = vs.filter(v => v[k] && !seen.has(`${v.ab}|${v.an}|${v.anzahl_umstiege}`) && seen.add(`${v.ab}|${v.an}|${v.anzahl_umstiege}`))
+		.sort((x, y) => (x[k] < y[k] ? -1 : x[k] > y[k] ? 1 : 0));
+	const inside = s.filter(v => v[k] >= lo && v[k] <= hi).slice(0, SHOW);
+	if (inside.length) return {verbindungen: inside, ausserhalb: false};
+	const before = s.filter(v => v[k] < lo).pop(), after = s.find(v => v[k] > hi);
+	return {verbindungen: [before, after].filter(Boolean), ausserhalb: true, vorher: !!before, nachher: !!after};
+};
 
 export const fit = (o) => {  // at most MAX_OUT bytes: first the notes go, then journeys from the end
 	let s = JSON.stringify(o);
@@ -227,18 +235,28 @@ const main = async () => {
 			log('station', t0);
 			return out({ok: false, grund: `Bahnhof nicht gefunden: ${!von ? 'von' : 'nach'}`});
 		}
-		const p = {fromPlace: von.id, toPlace: nach.id, time: a.when.toISO(), arriveBy: String(a.art === 'an'),
-			numItineraries: String(MAX_JOURNEYS)};
-		if (a.umstiege != null) p.maxTransfers = String(a.umstiege);
-		const res = await get('/v5/plan', p);
-		const zeitpunkt = a.when.toFormat('yyyy-MM-dd HH:mm');
-		const verbindungen = choose((res.itineraries || []).slice(0, MAX_JOURNEYS).map(shapeJourney), a.art, zeitpunkt);
-		if (!verbindungen.length) {
+		// Transitous gives arrivals only up to the asked time (--an) or departures only from it (--ab): ask 60′ beyond
+		const an = a.art === 'an';
+		const plan = async (when, arriveBy) => {
+			const p = {fromPlace: von.id, toPlace: nach.id, time: when.toISO(), arriveBy: String(arriveBy), numItineraries: String(QUERY_N)};
+			if (a.umstiege != null) p.maxTransfers = String(a.umstiege);
+			return ((await get('/v5/plan', p)).itineraries || []).slice(0, QUERY_N).map(shapeJourney);
+		};
+		let list = await plan(an ? a.when.plus({minutes: 60}) : a.when.minus({minutes: 60}), an);
+		let r = choose(list, a.art, a.when);
+		if (r.ausserhalb && !(r.vorher && r.nachher) && allowed()) {  // one more search, only for the missing side
+			const later = !r.nachher;
+			list = list.concat(await plan(an ? a.when.plus({minutes: later ? 240 : -30}) : a.when.plus({minutes: later ? 30 : -240}), an));
+			r = choose(list, a.art, a.when);
+		}
+		const zeitpunkt = fmt(a.when);
+		if (!r.verbindungen.length) {
 			failures(true);
 			log('keine', t0);
-			return out({ok: false, grund: `keine Verbindung mit ${a.art === 'an' ? 'Ankunft bis' : 'Abfahrt ab'} ${a.zeit}`});
+			return out({ok: false, grund: `keine Verbindung um ${a.zeit} ±30′`});
 		}
-		const o = fit({ok: true, von: von.name, nach: nach.name, zeitpunkt, art: a.art, verbindungen, daten: DATA});
+		const o = fit({ok: true, von: von.name, nach: nach.name, zeitpunkt, art: a.art, ausserhalb_fenster: r.ausserhalb,
+			verbindungen: r.verbindungen, daten: DATA});
 		if (o.ok) writeJson(cached, o);
 		failures(o.ok);
 		log(o.ok ? `ok:${o.verbindungen.length}` : 'zu_gross', t0);
@@ -312,14 +330,25 @@ const selftest = () => {  // no network: argument checks and output shape on a m
 	assert(plan.ab === null && plan.ab_verspaetung === null && plan.ab_gleis === null && plan.ab_gleis_plan === '19', 'no realtime: plan only');
 	const J = (ab, an) => ({ab: `2026-11-08 ${ab}`, an: `2026-11-08 ${an}`});
 	const day = [J('08:53', '12:02'), J('09:41', '13:02'), J('10:53', '14:02'), J('11:38', '15:02'), J('12:53', '16:02'), J('13:53', '17:02')];
-	const T = (hm) => `2026-11-08 ${hm}`;
-	assert(choose(day, 'an', T('18:00')).map(v => v.an.slice(11)).join() === '15:02,16:02,17:02', 'an: 3 latest ≤ T, in order');
-	assert(choose(day, 'an', T('16:02')).map(v => v.an.slice(11)).join() === '14:02,15:02,16:02', 'an: ≤ includes T');
-	assert(choose(day, 'ab', T('09:00')).map(v => v.ab.slice(11)).join() === '09:41,10:53,11:38', 'ab: first 3 ≥ T');
-	assert(choose([...day].reverse(), 'ab', T('12:53')).map(v => v.ab.slice(11)).join() === '12:53,13:53', 'ab: unsorted input, ≥ includes T');
-	assert(choose(day, 'an', T('11:00')).length === 0 && choose(day, 'ab', T('14:00')).length === 0, 'none');
-	const late = shapeJourney({legs: [leg({to: {name: 'B', arrival: '2026-11-07T17:05:00Z', scheduledArrival: '2026-11-07T16:55:00Z'}})]});
-	assert(late.an === '2026-11-07 18:05' && choose([late], 'an', '2026-11-07 18:00').length === 0, 'live delay past T: out');
+	const T = (hm) => DateTime.fromISO(`2026-11-08T${hm}`, {zone: TZ});
+	const hms = (r, k) => r.verbindungen.map(v => v[k].slice(11)).join();
+	let r = choose(day, 'an', T('17:00'));
+	assert(!r.ausserhalb && hms(r, 'an') === '17:02', 'an: only inside 16:30–17:30');
+	r = choose([...day, J('13:30', '16:30'), J('14:00', '17:30'), J('14:01', '17:31')].reverse(), 'an', T('17:00'));
+	assert(!r.ausserhalb && hms(r, 'an') === '16:30,17:02,17:30', 'an: edges −30′/+30′ inside, +31′ out, in time order');
+	r = choose(Array.from({length: 9}, (_, i) => J(`08:0${i}`, `12:0${i}`)), 'an', T('12:00'));
+	assert(r.verbindungen.length === 6, 'at most 6');
+	r = choose(day, 'ab', T('09:30'));
+	assert(!r.ausserhalb && hms(r, 'ab') === '09:41', 'ab: only inside 09:00–10:00');
+	r = choose([...day, J('08:53', '12:02')], 'an', T('12:00'));
+	assert(r.verbindungen.length === 1, 'duplicates once');
+	r = choose([J('08:53', '12:02'), J('12:53', '16:02'), J('13:53', '17:02')], 'an', T('14:00'));
+	assert(r.ausserhalb && hms(r, 'an') === '12:02,16:02' && r.vorher && r.nachher, 'none inside: nearest before and after');
+	r = choose(day, 'an', T('18:30'));
+	assert(r.ausserhalb && hms(r, 'an') === '17:02' && r.vorher && !r.nachher, 'none inside, only before');
+	assert(choose([], 'ab', T('10:00')).verbindungen.length === 0, 'nothing at all');
+	const late = shapeJourney({legs: [leg({to: {name: 'B', arrival: '2026-11-07T17:35:00Z', scheduledArrival: '2026-11-07T16:55:00Z'}})]});
+	assert(late.an === '2026-11-07 18:35' && choose([late], 'an', DateTime.fromISO('2026-11-07T18:00', {zone: TZ})).ausserhalb, 'live delay past +30′: out');
 	const big = fit({ok: true, verbindungen: Array.from({length: 6}, () => ({...j, hinweise: ['x'.repeat(5000)]}))});
 	assert(Buffer.byteLength(JSON.stringify(big)) <= MAX_OUT && big.verbindungen.length >= 1, 'size');
 	console.log('selftest ok');
