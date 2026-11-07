@@ -1,0 +1,9 @@
+{
+  "name": "dienstdb",
+  "private": true,
+  "description": "Connection search for the Dienstbrain (dienst-db) through Transitous (MOTIS 2 API). Pinned, no auto-update.",
+  "type": "module",
+  "dependencies": {
+    "luxon": "3.7.2"
+  }
+}
