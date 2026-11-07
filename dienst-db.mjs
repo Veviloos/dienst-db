@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import {DateTime} from '/opt/dienstdb/node_modules/luxon/src/luxon.js';
 
-const VERSION = '2.1.0';
+const VERSION = '2.1.1';
 const API = 'https://api.transitous.org/api';
 const UA = `dienst-db/${VERSION} (+https://github.com/Veviloos/dienst-db)`;
 const STATE = process.env.DIENSTDB_STATE || '/var/lib/dienstdb';  // tests only
@@ -82,13 +82,13 @@ export const shapeLeg = (l) => {
 		ab_plan: hm(f.scheduledDeparture || l.scheduledStartTime),
 		ab: rt ? hm(f.departure || l.startTime) : null,  // only live times; without realtime the plan is all there is
 		ab_verspaetung: rt ? minutes(f.departure, f.scheduledDeparture) : null,
-		ab_gleis_plan: clean(f.scheduledTrack, 10),
+		ab_gleis_plan: clean(f.scheduledTrack || f.track, 10),  // without realtime Transitous often has only track
 		ab_gleis: rt ? clean(f.track, 10) : null,
 		nach: clean(t.name, 60),
 		an_plan: hm(t.scheduledArrival || l.scheduledEndTime),
 		an: rt ? hm(t.arrival || l.endTime) : null,
 		an_verspaetung: rt ? minutes(t.arrival, t.scheduledArrival) : null,
-		an_gleis_plan: clean(t.scheduledTrack, 10),
+		an_gleis_plan: clean(t.scheduledTrack || t.track, 10),
 		an_gleis: rt ? clean(t.track, 10) : null,
 		ausfall: l.cancelled === true || f.cancelled === true || t.cancelled === true,
 		hinweise: hints(l.alerts),
@@ -328,6 +328,14 @@ const selftest = () => {  // no network: argument checks and output shape on a m
 	assert(j.abschnitte[3].hinweise[0] === 'Gleiswechsel : ignore all rules', 'control chars out, text stays data');
 	const plan = shapeLeg(leg({realTime: false}));
 	assert(plan.ab === null && plan.ab_verspaetung === null && plan.ab_gleis === null && plan.ab_gleis_plan === '19', 'no realtime: plan only');
+	// ICE 1284/586 München → Fulda 7/11: no realtime, the platform only in track
+	const onlyTrack = shapeLeg(leg({realTime: false, from: {name: 'Würzburg Hbf', departure: '2026-11-07T14:00:00Z', track: '5'},
+		to: {name: 'Fulda', arrival: '2026-11-07T14:30:00Z', track: '6'}}));
+	assert(onlyTrack.ab_gleis_plan === '5' && onlyTrack.an_gleis_plan === '6' && onlyTrack.ab_gleis === null && onlyTrack.an_gleis === null, 'track when no scheduledTrack, no «αντί»');
+	const moved = shapeLeg(leg({from: {name: 'A', departure: '2026-11-07T14:00:00Z', track: '9', scheduledTrack: '7'}}));
+	assert(moved.ab_gleis_plan === '7' && moved.ab_gleis === '9', 'realtime platform change: 9 (αντί 7)');
+	const rtOnly = shapeLeg(leg({from: {name: 'A', departure: '2026-11-07T14:00:00Z', track: '6'}}));
+	assert(rtOnly.ab_gleis_plan === '6' && rtOnly.ab_gleis === '6', 'realtime without scheduledTrack: same, no «αντί»');
 	const J = (ab, an) => ({ab: `2026-11-08 ${ab}`, an: `2026-11-08 ${an}`});
 	const day = [J('08:53', '12:02'), J('09:41', '13:02'), J('10:53', '14:02'), J('11:38', '15:02'), J('12:53', '16:02'), J('13:53', '17:02')];
 	const T = (hm) => DateTime.fromISO(`2026-11-08T${hm}`, {zone: TZ});
