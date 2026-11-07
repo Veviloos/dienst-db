@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import {DateTime} from '/opt/dienstdb/node_modules/luxon/src/luxon.js';
 
-const VERSION = '2.0.0';
+const VERSION = '2.0.1';
 const API = 'https://api.transitous.org/api';
 const UA = `dienst-db/${VERSION} (+https://github.com/Veviloos/dienst-db)`;
 const STATE = process.env.DIENSTDB_STATE || '/var/lib/dienstdb';  // tests only
@@ -173,13 +173,24 @@ const get = async (path, params) => {
 const words = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/\p{M}/gu, '').replace(/ß/g, 'ss')
 	.split(/[^\p{L}\p{N}]+/u).filter(w => w && !['hbf', 'hauptbahnhof', 'bahnhof', 'bf'].includes(w));
 export const matches = (q, name) => { const n = words(name); return words(q).every(w => n.includes(w)); };
+const RAIL = ['HIGHSPEED_RAIL', 'LONG_DISTANCE', 'REGIONAL_RAIL', 'NIGHT_RAIL', 'SUBURBAN'];
+// only train stations (the same name exists as a bus stop elsewhere, e.g. «Fulda» in Konya); an exact name first
+export const pick = (q, res) => {
+	const ok = (Array.isArray(res) ? res : []).filter(s => s && typeof s.id === 'string' && s.id && matches(q, s.name)
+		&& Array.isArray(s.modes) && s.modes.some(m => RAIL.includes(m)));
+	const exact = ok.find(s => words(s.name).join(' ') === words(q).join(' '));
+	return exact || ok[0] || null;
+};
+// «Fulda Hbf»: the station is just «Fulda», and the query with Hbf finds other Hauptbahnhöfe; then once more without it
+export const bare = (q) => q.replace(/\b(hbf|hauptbahnhof|bahnhof|bf)\b\.?/giu, ' ').replace(/\s+/g, ' ').trim();
 
 const station = async (q) => {
 	const f = `${STATE}/stations.json`, key = q.toLowerCase().normalize('NFC');
 	const cache = readJson(f, {});
 	if (cache[key] && Date.now() - cache[key].t < STATION_CACHE_S * 1000) return cache[key].s;
-	const res = await get('/v1/geocode', {text: q, type: 'STOP', language: 'de'});
-	const hit = (Array.isArray(res) ? res : []).find(s => s && typeof s.id === 'string' && s.id && matches(q, s.name));
+	let hit = pick(q, await get('/v1/geocode', {text: q, type: 'STOP', language: 'de'}));
+	const q2 = bare(q);
+	if (!hit && q2 && q2 !== q) hit = pick(q2, await get('/v1/geocode', {text: q2, type: 'STOP', language: 'de'}));
 	if (!hit) return null;
 	const s = {id: hit.id.slice(0, 200), name: clean(hit.name, 60)};
 	cache[key] = {s, t: Date.now()};
@@ -256,6 +267,19 @@ const selftest = () => {  // no network: argument checks and output shape on a m
 	assert(matches('Frankfurt (Main) Hbf', 'Frankfurt (Main) Hauptbahnhof') && matches('Köln Hbf', 'Köln Hbf')
 		&& matches('Muenchen', 'Muenchen Ost') && matches('Würzburg', 'Würzburg Hbf') && matches('Gießen', 'Giessen'), 'station match');
 	assert(!matches('Xyzqwv Hbf', 'Hauptbahnhof/ZOB') && !matches('Köln Hbf', 'Kölner Str.'), 'no fuzzy station');
+	// real geocode answers of 7/11/2026 (shortened)
+	const fuldaHbf = [{id: 'de:hh', name: 'Hamburg Hbf', modes: ['HIGHSPEED_RAIL']}, {id: 'de:ka', name: 'Kassel Hbf', modes: ['REGIONAL_RAIL']}];
+	const fulda = [{id: 'de-DELFI_de:06631:11049', name: 'Fulda', modes: ['HIGHSPEED_RAIL', 'LONG_DISTANCE', 'REGIONAL_RAIL', 'BUS']},
+		{id: 'nl-OpenOV_4177285', name: 'Fulda', modes: []}, {id: 'tr-konya_1427a', name: 'Fulda', modes: ['BUS']},
+		{id: 'de:dom', name: 'Fulda Dom', modes: ['BUS', 'ODM']}];
+	assert(bare('Fulda Hbf') === 'Fulda' && bare('Frankfurt (Main) Hauptbahnhof') === 'Frankfurt (Main)' && bare('Kassel-Wilhelmshöhe') === 'Kassel-Wilhelmshöhe', 'bare');
+	assert(pick('Fulda Hbf', fuldaHbf) === null && pick('Fulda', fulda).id === 'de-DELFI_de:06631:11049', 'Fulda Hbf: 2nd round, the train station');
+	assert(pick('Fulda', fulda.slice(1)) === null, 'Fulda: never the Dutch stop or the bus in Konya');
+	const kassel = [{id: 'eu-flixbus_x', name: 'Kassel (Wilhelmshöhe train station)', modes: ['COACH']},
+		{id: 'de:park', name: 'Kassel Wilhelmshöhe (Park)', modes: ['TRAM', 'BUS']},
+		{id: 'de-DELFI_de:06611:200007', name: 'Kassel-Wilhelmshöhe', modes: ['HIGHSPEED_RAIL', 'LONG_DISTANCE', 'TRAM', 'BUS']}];
+	assert(pick('Kassel-Wilhelmshöhe', kassel).id === 'de-DELFI_de:06611:200007', 'Kassel-Wilhelmshöhe: the station');
+	assert(pick('Xyzqwv Hbf', fuldaHbf) === null && pick('Köln Hbf', [{id: 'x', name: 'Kölner Str.', modes: ['BUS']}]) === null, 'nothing');
 	const leg = (o) => ({mode: 'HIGHSPEED_RAIL', displayName: 'ICE 1', tripShortName: 'ICE 1', headsign: 'B', realTime: true,
 		from: {name: 'A', departure: '2026-11-07T13:59:00Z', scheduledDeparture: '2026-11-07T13:54:00Z', track: '19', scheduledTrack: '19'},
 		to: {name: 'B', arrival: '2026-11-07T15:31:00Z', scheduledArrival: '2026-11-07T15:31:00Z', track: '8', scheduledTrack: '8'}, ...o});
