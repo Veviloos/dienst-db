@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import {DateTime} from '/opt/dienstdb/node_modules/luxon/src/luxon.js';
 
-const VERSION = '2.1.1';
+const VERSION = '2.2.0';
 const API = 'https://api.transitous.org/api';
 const UA = `dienst-db/${VERSION} (+https://github.com/Veviloos/dienst-db)`;
 const STATE = process.env.DIENSTDB_STATE || '/var/lib/dienstdb';  // tests only
@@ -115,7 +115,7 @@ export const shapeJourney = (j) => {
 	const start = first?.ab || first?.ab_plan, end = last?.an || last?.an_plan;
 	const mins = start && end ? DateTime.fromFormat(end, 'yyyy-MM-dd HH:mm', {zone: TZ})
 		.diff(DateTime.fromFormat(start, 'yyyy-MM-dd HH:mm', {zone: TZ}), 'minutes').minutes : null;
-	return {
+	const o = {
 		ab: start, an: end,
 		dauer: mins == null ? null : `${Math.floor(mins / 60)}:${String(Math.round(mins % 60)).padStart(2, '0')}`,
 		anzahl_umstiege: Math.max(rides.length - 1, 0),
@@ -125,7 +125,17 @@ export const shapeJourney = (j) => {
 		umstiege,
 		hinweise: [],
 	};
+	return Object.defineProperty(o, 'raw', {value: rawLegs(j), enumerable: false});  // for «θα πάρω το N», never printed
 };
+
+// what a watch needs of each ride: the trip id and stop ids (not in the answer), planned times and platforms
+const rawLegs = (j) => (j.legs || []).filter(l => l.mode !== 'WALK' && typeof l.tripId === 'string').map(l => ({
+	tripId: l.tripId.slice(0, 200), zug: clean(l.displayName || l.routeShortName, 40),
+	von: clean(l.from?.name, 60), von_id: clean(l.from?.stopId, 200), nach: clean(l.to?.name, 60), nach_id: clean(l.to?.stopId, 200),
+	ab_plan: hm(l.from?.scheduledDeparture || l.scheduledStartTime), an_plan: hm(l.to?.scheduledArrival || l.scheduledEndTime),
+	// the platform as shown when chosen (live track first); «αντί» in a watch compares /trip answers only (see change)
+	gleis_ab: clean(l.from?.track || l.from?.scheduledTrack, 10), gleis_an: clean(l.to?.track || l.to?.scheduledTrack, 10),
+}));
 
 // only what fits the asked time T ± 30′ (arrival for --an, departure for --ab; live time if there is one), up to SHOW,
 // in time order. None inside: the nearest before and the nearest after, marked ausserhalb. Times are 'yyyy-MM-dd HH:mm'
@@ -214,8 +224,141 @@ const station = async (q) => {
 	return s;
 };
 
+// --- live watch: «θα πάρω το N» / «σταμάτα» / every 5′ «pruefen», all run by the Dienstbrain bot, never by Claude --------
+const LAST = `${STATE}/last.json`, WATCHES = `${STATE}/watches.json`;
+const WATCH_MAX = 2, TRIP_PER_DAY = 150, LAST_MAX_MS = 2 * 3_600_000, TRANSFER_MIN = 4, DELAY_MIN = 3;
+const dt = (s) => DateTime.fromFormat(s, 'yyyy-MM-dd HH:mm', {zone: TZ});
+const hh = (s) => (s ? s.slice(11, 16) : '?');
+const gap = (later, earlier) => Math.round(dt(later).diff(dt(earlier), 'minutes').minutes);
+const ends = (w) => { const l = w.legs[w.legs.length - 1]; return dt(l.st.an || l.an_plan).plus({minutes: 10}); };
+const describe = (legs) => legs.map(l => `${l.zug} ${hh(l.ab_plan)} ${l.von} → ${l.nach} ${hh(l.an_plan)}`).join(' · ');
+
+export const beobachten = (n, now = DateTime.now().setZone(TZ)) => {
+	const last = readJson(LAST, null);
+	if (!last || Date.now() - last.t > LAST_MAX_MS) return 'ℹ️ Δεν βρίσκω αναζήτηση των τελευταίων 2 ωρών. Ψάξε πρώτα σύνδεση.';
+	const legs = (last.list || [])[n - 1];
+	if (!legs?.length) return `ℹ️ Δεν υπάρχει σύνδεση ${n} στην τελευταία αναζήτηση.`;
+	const ws = readJson(WATCHES, []).filter(w => ends(w) > now);
+	if (ws.length >= WATCH_MAX) return 'ℹ️ Παρακολουθώ ήδη 2 ταξίδια. Γράψε πρώτα «σταμάτα 1» ή «σταμάτα 2».';
+	const w = {slot: [1, 2].find(s => !ws.some(x => x.slot === s)), legs: legs.map(l => ({...l, st: {}}))};
+	if (ends(w) <= now) return 'ℹ️ Αυτή η σύνδεση έχει ήδη φτάσει.';
+	writeJson(WATCHES, [...ws, w]);
+	return `👀 Παρακολουθώ (${w.slot}): ${describe(legs)}. Σου γράφω μόνο αν αλλάξει κάτι· «σταμάτα» για τέλος.`;
+};
+
+export const stopp = (n) => {
+	const ws = readJson(WATCHES, []);
+	const keep = n ? ws.filter(w => w.slot !== n) : [];
+	writeJson(WATCHES, keep);
+	return keep.length === ws.length ? 'ℹ️ Δεν παρακολουθώ κάτι τέτοιο.' : `⏹ Η παρακολούθηση${n ? ` ${n}` : ''} σταμάτησε.`;
+};
+
+// one ride after a /trip answer → the messages for what changed since the last message (and the new state in l.st)
+export const change = (l, info, now) => {
+	const st = l.st, msgs = [];
+	if (!info.rt && !st.nort) { msgs.push(`ℹ️ ${l.zug}: το Transitous δεν έχει ζωντανά στοιχεία γι' αυτό το τρένο.`); st.nort = true; }
+	if (info.cancelled && !st.cancel) { msgs.push(`❌ ${l.zug} (${l.von} → ${l.nach}) ακυρώθηκε.`); st.cancel = true; }
+	if (info.rt) {
+		if (info.ab) st.ab = info.ab;
+		if (info.an) st.an = info.an;
+		const left = now >= dt(st.ab || l.ab_plan);
+		const delay = left ? (st.an ? gap(st.an, l.an_plan) : null) : (st.ab ? gap(st.ab, l.ab_plan) : null);
+		const was = st.delay || 0;
+		if (delay != null && (delay >= DELAY_MIN || was >= DELAY_MIN) && Math.abs(delay - was) >= DELAY_MIN) {
+			msgs.push(delay >= DELAY_MIN
+				? `⏱ ${l.zug}: +${delay}′, ${left ? `φτάνει ${l.nach} ${hh(st.an)}` : `φεύγει ${l.von} ${hh(st.ab)}`}`
+				: `✅ ${l.zug}: πάλι σχεδόν στην ώρα (${delay >= 0 ? '+' : ''}${delay}′)`);
+			st.delay = delay;
+		}
+		// /plan and /trip may name the same platform differently (Köln Messe/Deutz: 94 vs 12): the first /trip answer is
+		// the baseline, silently; only a later change is a message
+		for (const [k, where, at] of [['gleis_ab', l.von, !left], ['gleis_an', l.nach, true]]) {
+			const nowTrack = info[k];
+			if (!nowTrack) continue;
+			if (st[k] === undefined) st[k] = nowTrack;
+			else if (at && nowTrack !== st[k]) {
+				msgs.push(`🔀 ${l.zug} ${where}: Gl. ${nowTrack} αντί ${st[k]}`);
+				st[k] = nowTrack;
+			}
+		}
+	}
+	return msgs;
+};
+
+// changes of train: warn once when less than TRANSFER_MIN is left (and it got worse than planned), once more when it is fine again
+export const transfers = (legs) => {
+	const msgs = [];
+	for (let i = 0; i + 1 < legs.length; i++) {
+		const a = legs[i], b = legs[i + 1];
+		const m = gap(b.st.ab || b.ab_plan, a.st.an || a.an_plan), planned = gap(b.ab_plan, a.an_plan);
+		if (m < TRANSFER_MIN && m < planned && !a.st.tw) {
+			msgs.push(`⚠️ Αλλαγή στο ${a.nach}: φτάνεις ${hh(a.st.an || a.an_plan)}, το ${b.zug} φεύγει ${hh(b.st.ab || b.ab_plan)} (${m}′). Μάλλον δεν προλαβαίνεται.`);
+			a.st.tw = true;
+		} else if (a.st.tw && m >= TRANSFER_MIN) {
+			msgs.push(`✅ Αλλαγή στο ${a.nach}: προλαβαίνεται πάλι (${m}′).`);
+			a.st.tw = false;
+		}
+	}
+	return msgs;
+};
+
+// which rides to ask now: from 60′ before departure to arrival; every 10′, every 5′ in the last 15′ before departure
+export const due = (l, now) => {
+	const dep = dt(l.st.ab || l.ab_plan), arr = dt(l.st.an || l.an_plan);
+	if (now < dep.minus({minutes: 60}) || now > arr) return false;
+	const every = now >= dep.minus({minutes: 15}) && now < dep ? 5 : 10;
+	return !l.st.checked || now.diff(DateTime.fromISO(l.st.checked), 'minutes').minutes >= every - 0.5;
+};
+
+const tripAllowed = () => {
+	const f = `${STATE}/rate.json`, day = DateTime.now().setZone(TZ).toISODate(), r = readJson(f, {});
+	const n = r.trip_day === day ? r.trip_n || 0 : 0;
+	if (n >= TRIP_PER_DAY) return false;
+	writeJson(f, {...r, trip_day: day, trip_n: n + 1});
+	return true;
+};
+
+const stopInfo = (res, l) => {
+	const t = (res.legs || [])[0] || {};
+	const stops = [t.from, ...(t.intermediateStops || []), t.to].filter(Boolean);
+	const find = (id, name) => stops.find(s => s.stopId === id) || stops.find(s => clean(s.name, 60) === name) || {};
+	const b = find(l.von_id, l.von), e = find(l.nach_id, l.nach);
+	return {rt: t.realTime === true, cancelled: t.cancelled === true || b.cancelled === true || e.cancelled === true,
+		ab: hm(b.departure), an: hm(e.arrival), gleis_ab: clean(b.track, 10), gleis_an: clean(e.track, 10)};
+};
+
+const pruefen = async () => {
+	const now = DateTime.now().setZone(TZ);
+	let ws = readJson(WATCHES, []);
+	const before = ws.length;
+	ws = ws.filter(w => ends(w) > now);  // the end is silent
+	const msgs = [];
+	for (const w of ws) {
+		for (const l of w.legs) {
+			if (!due(l, now)) continue;
+			if (!tripAllowed()) {
+				writeJson(WATCHES, []);
+				return {ok: true, nachrichten: [...msgs, '⚠️ Σταμάτησα την παρακολούθηση για σήμερα (όριο ερωτήσεων).']};
+			}
+			l.st.checked = now.toISO();
+			try {
+				msgs.push(...change(l, stopInfo(await get('/v5/trip', {tripId: l.tripId}), l), now));
+			} catch { /* network or Transitous down: try again at the next round, no message */ }
+		}
+		msgs.push(...transfers(w.legs));
+	}
+	if (ws.length || before) writeJson(WATCHES, ws);
+	return {ok: true, nachrichten: msgs};
+};
+
 const main = async () => {
 	const t0 = Date.now();
+	const [cmd, n, extra] = process.argv.slice(2);
+	if (cmd === 'beobachten' && /^[1-6]$/.test(n || '') && !extra) return out({ok: true, text: beobachten(Number(n))});
+	if (cmd === 'stopp' && (!n || /^[12]$/.test(n)) && !extra) return out({ok: true, text: stopp(n ? Number(n) : null)});
+	if (cmd === 'pruefen' && !n) {
+		try { return out(await pruefen()); } catch { log('pruefen:fehler', t0); return out({ok: false, nachrichten: []}); }
+	}
 	const a = parseArgs(process.argv.slice(2));
 	if (a.error) { log(`ungueltig:${a.error}`, t0); return out({ok: false, grund: `ungültig: ${a.error}`}); }
 	const dir = cleanup();
@@ -224,6 +367,7 @@ const main = async () => {
 	try {
 		if (Date.now() - fs.statSync(cached).mtimeMs < CACHE_S * 1000) {
 			log('cache', t0);
+			writeJson(LAST, {...readJson(`${cached}.last`, {list: []}), t: Date.now()});
 			return process.stdout.write(fs.readFileSync(cached, 'utf8'));
 		}
 	} catch {}
@@ -257,7 +401,12 @@ const main = async () => {
 		}
 		const o = fit({ok: true, von: von.name, nach: nach.name, zeitpunkt, art: a.art, ausserhalb_fenster: r.ausserhalb,
 			verbindungen: r.verbindungen, daten: DATA});
-		if (o.ok) writeJson(cached, o);
+		if (o.ok) {
+			const last = {t: Date.now(), list: o.verbindungen.map(v => v.raw || [])};  // same order as the answer: «το N»
+			writeJson(cached, o);
+			writeJson(`${cached}.last`, last);
+			writeJson(LAST, last);
+		}
 		failures(o.ok);
 		log(o.ok ? `ok:${o.verbindungen.length}` : 'zu_gross', t0);
 		out(o);
@@ -359,6 +508,58 @@ const selftest = () => {  // no network: argument checks and output shape on a m
 	assert(late.an === '2026-11-07 18:35' && choose([late], 'an', DateTime.fromISO('2026-11-07T18:00', {zone: TZ})).ausserhalb, 'live delay past +30′: out');
 	const big = fit({ok: true, verbindungen: Array.from({length: 6}, () => ({...j, hinweise: ['x'.repeat(5000)]}))});
 	assert(Buffer.byteLength(JSON.stringify(big)) <= MAX_OUT && big.verbindungen.length >= 1, 'size');
+	// --- watch ---------------------------------------------------------------------------------------------------
+	const at = (s) => DateTime.fromISO(`2026-11-07T${s}`, {zone: TZ});
+	const L = (o = {}) => ({tripId: 't1', zug: 'ICE 1284', von: 'München Hbf', von_id: 'm', nach: 'Würzburg Hbf', nach_id: 'w',
+		ab_plan: '2026-11-07 14:52', an_plan: '2026-11-07 16:40', gleis_ab: '15', gleis_an: '5', st: {}, ...o});
+	const I = (o = {}) => ({rt: true, cancelled: false, ab: '2026-11-07 14:52', an: '2026-11-07 16:40', gleis_ab: '15', gleis_an: '5', ...o});
+	let l = L();
+	assert(change(l, I(), at('14:00')).length === 0, 'nothing changed: no message');
+	assert(change(l, I({ab: '2026-11-07 14:54'}), at('14:10')).length === 0, '+2′: nothing');
+	let m = change(l, I({ab: '2026-11-07 14:59'}), at('14:20'));
+	assert(m.length === 1 && m[0] === '⏱ ICE 1284: +7′, φεύγει München Hbf 14:59', '+7′ once');
+	assert(change(l, I({ab: '2026-11-07 15:00'}), at('14:30')).length === 0, '+8′ after +7′: not again');
+	assert(change(l, I({ab: '2026-11-07 15:03'}), at('14:40'))[0].startsWith('⏱ ICE 1284: +11′'), '+11′: again');
+	assert(change(l, I({ab: '2026-11-07 14:53'}), at('14:45'))[0].startsWith('✅ ICE 1284: πάλι σχεδόν στην ώρα'), 'back on time');
+	m = change(l, I({ab: '2026-11-07 14:53', gleis_ab: '18'}), at('14:46'));
+	assert(m.length === 1 && m[0] === '🔀 ICE 1284 München Hbf: Gl. 18 αντί 15', 'platform change');
+	assert(change(l, I({ab: '2026-11-07 14:53', gleis_ab: '18'}), at('14:50')).length === 0, 'platform: once');
+	m = change(l, I({ab: '2026-11-07 14:53', an: '2026-11-07 16:49'}), at('15:30'));
+	assert(m[0] === '⏱ ICE 1284: +9′, φτάνει Würzburg Hbf 16:49', 'riding: arrival delay');
+	assert(change(L(), I({cancelled: true}), at('14:00'))[0].startsWith('❌ ICE 1284 (München Hbf → Würzburg Hbf) ακυρώθηκε'), 'cancelled');
+	l = L();
+	assert(change(l, I({rt: false}), at('14:00')).length === 1 && change(l, I({rt: false}), at('14:10')).length === 0, 'no realtime: once');
+	const a1 = L({an_plan: '2026-11-07 16:40'}), b1 = L({tripId: 't2', zug: 'ICE 586', von: 'Würzburg Hbf', nach: 'Fulda',
+		ab_plan: '2026-11-07 16:48', an_plan: '2026-11-07 17:30', gleis_ab: '6'});
+	assert(transfers([a1, b1]).length === 0, 'transfer 8′: fine');
+	a1.st.an = '2026-11-07 16:44';
+	assert(transfers([a1, b1]).length === 0, 'transfer 4′: still fine');
+	a1.st.an = '2026-11-07 16:45';
+	m = transfers([a1, b1]);
+	assert(m.length === 1 && m[0].startsWith('⚠️ Αλλαγή στο Würzburg Hbf: φτάνεις 16:45, το ICE 586 φεύγει 16:48 (3′)'), 'transfer 3′: warn');
+	assert(transfers([a1, b1]).length === 0, 'transfer warning once');
+	b1.st.ab = '2026-11-07 16:52';
+	assert(transfers([a1, b1])[0].startsWith('✅ Αλλαγή στο Würzburg Hbf: προλαβαίνεται πάλι (7′)'), 'transfer fine again');
+	const tight = [L({an_plan: '2026-11-07 16:40'}), L({ab_plan: '2026-11-07 16:43', an_plan: '2026-11-07 17:30'})];
+	assert(transfers(tight).length === 0, 'planned 3′ change: no warning unless it gets worse');
+	l = L();
+	assert(!due(l, at('13:51')) && due(l, at('13:52')), 'due from 60′ before');
+	l.st.checked = at('14:30').toISO();
+	assert(!due(l, at('14:35')) && due(l, at('14:40')), 'every 10′ before the last 15′');
+	l.st.checked = at('14:40').toISO();
+	assert(due(l, at('14:45')), 'every 5′ in the last 15′');
+	assert(!due(L(), at('16:41')), 'after arrival: done');
+	if (process.env.DIENSTDB_STATE) {  // files only in a test folder, never the real state
+		fs.writeFileSync(LAST, JSON.stringify({t: Date.now(), list: [[L()], [L({zug: 'ICE 2'})], [L({zug: 'ICE 3'})]]}));
+		const now = at('12:00');
+		assert(beobachten(2, now).startsWith('👀 Παρακολουθώ (1): ICE 2 14:52'), 'watch 2');
+		assert(beobachten(1, now).startsWith('👀 Παρακολουθώ (2)') && beobachten(3, now).includes('ήδη 2'), 'at most 2');
+		assert(beobachten(5, now).includes('Δεν υπάρχει σύνδεση 5'), 'no such connection');
+		assert(stopp(1) === '⏹ Η παρακολούθηση 1 σταμάτησε.' && readJson(WATCHES, []).length === 1, 'stop 1');
+		assert(stopp(null) === '⏹ Η παρακολούθηση σταμάτησε.' && readJson(WATCHES, []).length === 0 && stopp(null).startsWith('ℹ️'), 'stop all');
+		fs.writeFileSync(LAST, JSON.stringify({t: Date.now() - LAST_MAX_MS - 1, list: [[L()]]}));
+		assert(beobachten(1, now).includes('2 ωρών'), 'old search');
+	}
 	console.log('selftest ok');
 };
 
