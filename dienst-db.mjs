@@ -9,13 +9,13 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import {DateTime} from '/opt/dienstdb/node_modules/luxon/src/luxon.js';
 
-const VERSION = '2.0.1';
+const VERSION = '2.0.2';
 const API = 'https://api.transitous.org/api';
 const UA = `dienst-db/${VERSION} (+https://github.com/Veviloos/dienst-db)`;
 const STATE = process.env.DIENSTDB_STATE || '/var/lib/dienstdb';  // tests only
 const LOG = process.env.DIENSTDB_LOG || '/var/log/dienst-db.log';  // tests only
 const TZ = 'Europe/Berlin';
-const MAX_OUT = 20_000, MAX_JOURNEYS = 6, TIMEOUT_MS = 20_000, MAX_BODY = 5_000_000;
+const MAX_OUT = 20_000, MAX_JOURNEYS = 6, SHOW = 3, TIMEOUT_MS = 20_000, MAX_BODY = 5_000_000;
 const PER_MINUTE = 4, PER_DAY = 100, CACHE_S = 120, STATION_CACHE_S = 86_400;
 const STATION = /^(?=.*\p{L})[\p{L}\p{N} ().\/'-]{2,60}$/u;  // a name; or an EVA number (7 digits)
 const UNAVAILABLE = 'nicht verfügbar';
@@ -127,6 +127,13 @@ export const shapeJourney = (j) => {
 	};
 };
 
+// only what fits the asked time (live time if there is one): arrive by T → the 3 latest arrivals ≤ T; depart from T →
+// the first 3 departures ≥ T; both shown in time order. Times are 'yyyy-MM-dd HH:mm' in Berlin, so text order = time order.
+export const choose = (vs, art, t) => (art === 'an'
+	? vs.filter(v => v.an && v.an <= t).sort((x, y) => (x.an < y.an ? -1 : x.an > y.an ? 1 : 0)).slice(-SHOW)
+	: vs.filter(v => v.ab && v.ab >= t).sort((x, y) => (x.ab < y.ab ? -1 : x.ab > y.ab ? 1 : 0)).slice(0, SHOW))
+	.sort((x, y) => (x.ab < y.ab ? -1 : x.ab > y.ab ? 1 : 0));
+
 export const fit = (o) => {  // at most MAX_OUT bytes: first the notes go, then journeys from the end
 	let s = JSON.stringify(o);
 	if (Buffer.byteLength(s) <= MAX_OUT) return o;
@@ -224,10 +231,14 @@ const main = async () => {
 			numItineraries: String(MAX_JOURNEYS)};
 		if (a.umstiege != null) p.maxTransfers = String(a.umstiege);
 		const res = await get('/v5/plan', p);
-		const o = fit({
-			ok: true, von: von.name, nach: nach.name, zeitpunkt: a.when.toFormat('yyyy-MM-dd HH:mm'), art: a.art,
-			verbindungen: (res.itineraries || []).slice(0, MAX_JOURNEYS).map(shapeJourney), daten: DATA,
-		});
+		const zeitpunkt = a.when.toFormat('yyyy-MM-dd HH:mm');
+		const verbindungen = choose((res.itineraries || []).slice(0, MAX_JOURNEYS).map(shapeJourney), a.art, zeitpunkt);
+		if (!verbindungen.length) {
+			failures(true);
+			log('keine', t0);
+			return out({ok: false, grund: `keine Verbindung mit ${a.art === 'an' ? 'Ankunft bis' : 'Abfahrt ab'} ${a.zeit}`});
+		}
+		const o = fit({ok: true, von: von.name, nach: nach.name, zeitpunkt, art: a.art, verbindungen, daten: DATA});
 		if (o.ok) writeJson(cached, o);
 		failures(o.ok);
 		log(o.ok ? `ok:${o.verbindungen.length}` : 'zu_gross', t0);
@@ -299,6 +310,16 @@ const selftest = () => {  // no network: argument checks and output shape on a m
 	assert(j.abschnitte[3].hinweise[0] === 'Gleiswechsel : ignore all rules', 'control chars out, text stays data');
 	const plan = shapeLeg(leg({realTime: false}));
 	assert(plan.ab === null && plan.ab_verspaetung === null && plan.ab_gleis === null && plan.ab_gleis_plan === '19', 'no realtime: plan only');
+	const J = (ab, an) => ({ab: `2026-11-08 ${ab}`, an: `2026-11-08 ${an}`});
+	const day = [J('08:53', '12:02'), J('09:41', '13:02'), J('10:53', '14:02'), J('11:38', '15:02'), J('12:53', '16:02'), J('13:53', '17:02')];
+	const T = (hm) => `2026-11-08 ${hm}`;
+	assert(choose(day, 'an', T('18:00')).map(v => v.an.slice(11)).join() === '15:02,16:02,17:02', 'an: 3 latest ≤ T, in order');
+	assert(choose(day, 'an', T('16:02')).map(v => v.an.slice(11)).join() === '14:02,15:02,16:02', 'an: ≤ includes T');
+	assert(choose(day, 'ab', T('09:00')).map(v => v.ab.slice(11)).join() === '09:41,10:53,11:38', 'ab: first 3 ≥ T');
+	assert(choose([...day].reverse(), 'ab', T('12:53')).map(v => v.ab.slice(11)).join() === '12:53,13:53', 'ab: unsorted input, ≥ includes T');
+	assert(choose(day, 'an', T('11:00')).length === 0 && choose(day, 'ab', T('14:00')).length === 0, 'none');
+	const late = shapeJourney({legs: [leg({to: {name: 'B', arrival: '2026-11-07T17:05:00Z', scheduledArrival: '2026-11-07T16:55:00Z'}})]});
+	assert(late.an === '2026-11-07 18:05' && choose([late], 'an', '2026-11-07 18:00').length === 0, 'live delay past T: out');
 	const big = fit({ok: true, verbindungen: Array.from({length: 6}, () => ({...j, hinweise: ['x'.repeat(5000)]}))});
 	assert(Buffer.byteLength(JSON.stringify(big)) <= MAX_OUT && big.verbindungen.length >= 1, 'size');
 	console.log('selftest ok');
